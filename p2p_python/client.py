@@ -10,8 +10,9 @@ import random
 import copy
 import queue
 import collections
+import socket
 from hashlib import sha256
-from threading import Thread
+from threading import Thread, get_ident
 from nem_ed25519.base import Encryption
 from .config import C, V, Debug, PeerToPeerError
 from .core import Core
@@ -20,7 +21,8 @@ from .tool.utils import StackDict, EventIgnition, JsonDataBase, QueueSystem
 from .tool.upnpc import UpnpClient
 
 LOCAL_IP = UpnpClient.get_localhost_ip()
-GLOBAL_IP = UpnpClient.get_global_ip()
+GLOBAL_IPV4 = UpnpClient.get_global_ip()
+GLOBAL_IPV6 = UpnpClient.get_global_ip_ipv6()
 STICKY_LIMIT = 2
 
 # Constant type
@@ -49,7 +51,7 @@ class PeerClient:
 
     def __init__(self, listen=15, f_local=False):
         assert V.DATA_PATH is not None, 'Setup p2p params before PeerClientClass init.'
-        self.p2p = Core(host='127.0.0.1' if f_local else '', listen=listen)
+        self.p2p = Core(host='localhost' if f_local else None, listen=listen)
         self.broadcast_que = QueueSystem()  # BroadcastDataが流れてくる
         self.event = EventIgnition()  # DirectCmdを受け付ける窓口
         self.__broadcast_uuid = collections.deque(maxlen=listen*20)  # Broadcastされたuuid
@@ -59,22 +61,30 @@ class PeerClient:
         # recode traffic if f_debug true
         if Debug.F_RECODE_TRAFFIC:
             self.p2p.traffic.recode_dir = V.TMP_PATH
+        self.threadid = None
 
     def close(self):
         self.p2p.close()
         self.f_stop = True
 
-    def start(self, f_stabilize=True):
+    def start(self, s_family=socket.AF_UNSPEC, f_stabilize=True):
+        processing_que = self.p2p.core_que.create()
+        broadcast_que = queue.LifoQueue()
+
         def processing():
-            que = self.p2p.core_que.create()
+            self.threadid = get_ident()
             while not self.f_stop:
                 user = msg_body = None
                 try:
-                    user, msg_body = que.get(timeout=1)
+                    user, msg_body = processing_que.get(timeout=1)
                     item = bjson.loads(msg_body)
 
                     if item['type'] == T_REQUEST:
-                        self.type_request(user=user, item=item)
+                        if item['cmd'] == ClientCmd.BROADCAST:
+                            # broadcastはCheckを含む為に別スレッド
+                            broadcast_que.put((user, item))
+                        else:
+                            self.type_request(user=user, item=item)
                     elif item['type'] == T_RESPONSE:
                         self.type_response(user=user, item=item)
                     elif item['type'] == T_ACK:
@@ -91,13 +101,28 @@ class PeerClient:
                                   .format(user.name, msg_body, e), exc_info=Debug.P_EXCEPTION)
             self.f_finish = True
             self.f_running = False
-            logging.info("Close process.")
+            logging.info("Close processing.")
+
+        def broadcast():
+            while not self.f_stop:
+                user = None
+                try:
+                    user, item = broadcast_que.get(timeout=1)
+                    self.type_request(user=user, item=item)
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    logging.debug("Processing error, ({}, {})"
+                                  .format(user.name, e), exc_info=Debug.P_EXCEPTION)
+            logging.info("Close broadcast.")
+
         self.f_running = True
-        self.p2p.start()
+        self.p2p.start(s_family)
         if f_stabilize:
             Thread(target=self.stabilize, name='Stabilize', daemon=True).start()
         # Processing
         Thread(target=processing, name='Process', daemon=True).start()
+        Thread(target=broadcast, name="Broadcast", daemon=True).start()
         logging.info("start user, name is {}, port is {}".format(V.SERVER_NAME, V.P2P_PORT))
 
     def type_request(self, user, item):
@@ -363,6 +388,7 @@ class PeerClient:
         return c  # 送った送信先
 
     def send_command(self, cmd, data=None, uuid=None, user=None, timeout=10):
+        assert get_ident() != self.threadid, "The thread is used by p2p_python!"
         uuid = uuid if uuid else random.randint(10, 0xffffffff)
         temperate = {
             'type': T_REQUEST,
@@ -393,18 +419,18 @@ class PeerClient:
         # ネットワークにメッセージを送信
         que = queue.LifoQueue()
         self.__waiting_result.put(uuid, que)
-        self._send_msg(item=temperate, allows=allows)
+        send_num = self._send_msg(item=temperate, allows=allows)
+        if send_num == 0:
+            raise PeerToPeerError('We try to send no client? {}clients connected.'.format(len(self.p2p.user)))
         # 返事が返ってくるのを待つ
         try:
             user, item = que.get(timeout=timeout)
             user.warn = 0
             self.__waiting_result.put(uuid, None)
-            del que
         except queue.Empty:
             self.__waiting_result.put(uuid, None)
-            del que
-            self.p2p.remove_connection(user)
-            name = user.name if user else 'ManyUser({})'.format(len(allows))
+            self.p2p.remove_connection(user, "Timeout by waiting {}".format(cmd))
+            name = user.name if user else '{}users'.format(len(allows))
             raise TimeoutError('command timeout {} {} {} {}'.format(cmd, uuid, name, data))
 
         if cmd == ClientCmd.BROADCAST:
@@ -517,9 +543,11 @@ class PeerClient:
         time.sleep(5)
         logging.info("start stabilize.")
         ignore_peers = {
-            (GLOBAL_IP, V.P2P_PORT),
+            (GLOBAL_IPV4, V.P2P_PORT),
+            (GLOBAL_IPV6, V.P2P_PORT),
             (LOCAL_IP, V.P2P_PORT),
-            ('127.0.0.1', V.P2P_PORT)}
+            ('127.0.0.1', V.P2P_PORT),
+            ('::1', V.P2P_PORT)}
         if len(self.peers) == 0:
             logging.info("peer list is zero, need bootnode.")
         else:
@@ -553,12 +581,11 @@ class PeerClient:
                 time.sleep(5)
             elif count < 5 and len(self.p2p.user) < need_connection:
                 time.sleep(2)
-            elif count % 24 == 1:
-                time.sleep(5 * (1 + random.random()))
-            elif count % 701 == 1:
-                logging.debug("Sticky list refresh now. {}".format(len(sticky_nodes)))
+            elif len(self.p2p.user) < need_connection:
                 sticky_nodes.clear()
                 time.sleep(5)
+            elif count % 24 == 1:
+                time.sleep(5 * (1 + random.random()))
             else:
                 time.sleep(5)
                 continue

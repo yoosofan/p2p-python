@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import json
+import bjson
 import logging
 import random
 import socket
 import time
 import zlib
+import selectors
 from threading import Thread, Lock
 from nem_ed25519.base import Encryption
 from .tool.traffic import Traffic
@@ -18,21 +20,21 @@ from .user import User
 SERVER_SIDE = 'Server'
 CLIENT_SIDE = 'Client'
 
+listen_sel = selectors.DefaultSelector()
 
-class Core(Thread):
+
+class Core:
     f_stop = False
     f_finish = False
     f_running = False
-    server_sock = None
 
-    def __init__(self, host='', listen=15, buffsize=2048):
+    def __init__(self, host=None, listen=15, buffsize=2048):
         assert V.DATA_PATH is not None, 'Setup p2p params before CoreClass init.'
-        super().__init__(name='InnerCore', daemon=True)
         self.start_time = int(time.time())
         self.number = 0
         self.user = list()
         self.lock = Lock()
-        self.host = host
+        self.host = host  # local=>'localhost', 'global'=>None
         self.ecc = Encryption()
         self.ecc.secret_key()
         self.ecc.public_key()
@@ -44,57 +46,72 @@ class Core(Thread):
     def close(self):
         if not self.f_running:
             raise PeerToPeerError('Core is not running.')
-        self.f_stop = True
         self.traffic.close()
-        # Server/client のソケットを全て閉じる
-        try: self.server_sock.close()
-        except: pass
         for user in self.user:
-            try: user.sock.close()
-            except: pass
+            self.remove_connection(user, 'Manually closing.')
+        listen_sel.close()
+        self.f_stop = True
 
-    def run(self):
-        self.traffic.start()
-        # Pooling connection
-        if not V.P2P_ACCEPT:
-            logging.info('You set p2p accept flag False.')
-            return
-
-        sock = host_port = None
-        server_sock = self.__create_server_sock()
-        logging.info("Start server %d" % V.P2P_PORT)
-        self.f_running = True
-        while not self.f_stop:
+    def start(self, s_family=socket.AF_UNSPEC):
+        def server_listen(server_sock, mask):
             try:
                 sock, host_port = server_sock.accept()
                 Thread(target=self.__initial_connection_check,
                        args=(sock, host_port), daemon=True).start()
-
-            except json.decoder.JSONDecodeError:
-                try: sock.close()
-                except: pass
-                logging.debug("JSONDecodeError by {}".format(host_port[0]))
+                logging.info("Server accept from {}".format(host_port))
             except OSError as e:
-                try: sock.close()
-                except: pass
                 logging.debug("OSError {}".format(e))
             except Exception as e:
-                try: sock.close()
-                except: pass
                 logging.debug(e, exc_info=Debug.P_EXCEPTION)
-        try: server_sock.close()
-        except: pass
-        self.f_finish = True
-        self.f_running = False
-        logging.info("Server closed.")
 
-    def __create_server_sock(self):
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind((self.host, V.P2P_PORT))
-        server_sock.listen(self.listen)
-        self.server_sock = server_sock
-        return server_sock
+        def create_server_socks():
+            for res in socket.getaddrinfo(self.host, V.P2P_PORT, s_family, socket.SOCK_STREAM, 0, socket.AI_PASSIVE):
+                af, sock_type, proto, canon_name, sa = res
+                try:
+                    sock = socket.socket(af, sock_type, proto)
+                except OSError as e:
+                    logging.debug("Failed socket.socket {}".format(sa))
+                    continue
+                try:
+                    sock.bind(sa)
+                    sock.listen(self.listen)
+                except OSError as e:
+                    sock.close()
+                    logging.debug("Failed bind or listen {}".format(sa))
+                    continue
+                if af == socket.AF_INET or af == socket.AF_INET6:
+                    listen_sel.register(sock, selectors.EVENT_READ, server_listen)
+                    self.f_running = True
+                    logging.info("New server {} {}".format("IPV4" if sock.family == 2 else "IPV6", sa))
+                else:
+                    logging.warning("Not found socket type {}".format(af))
+            if len(listen_sel.get_map()) == 0:
+                logging.error('could not open sockets')
+                V.P2P_ACCEPT = False
+
+        def listen_loop():
+            while not self.f_stop:
+                try:
+                    while len(listen_sel.get_map()) == 0:
+                        time.sleep(0.5)
+                    events = listen_sel.select()
+                    for key, mask in events:
+                        callback = key.data
+                        callback(key.fileobj, mask)
+                except BaseException as e:
+                    logging.error(e)
+                    time.sleep(30)
+
+        assert s_family in (socket.AF_INET, socket.AF_INET6, socket.AF_UNSPEC)
+        self.traffic.start()
+        Thread(target=listen_loop, name='Listen', daemon=True).start()
+        # Pooling connection
+        if not V.P2P_ACCEPT:
+            logging.info('You set p2p accept flag False.')
+        else:
+            # create server ipv4/ipv6
+            create_server_socks()
+        self.f_running = True
 
     def get_server_header(self):
         return {
@@ -108,13 +125,25 @@ class Core(Thread):
     def create_connection(self, host, port):
         sock = host_port = None
         try:
-            host_port = (socket.gethostbyname(host), int(port))
-            if self.host_port2user(host_port) is not None:
-                return False  # Already connected.
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            # Connection
-            sock.connect(host_port)
+            for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+                af, socktype, proto, canonname, host_port = res
+                try:
+                    sock = socket.socket(af, socktype, proto)
+                except OSError:
+                    continue
+                if self.host_port2user(host_port) is not None:
+                    continue  # Already connected.
+                sock.settimeout(10)
+                # Connection
+                try:
+                    sock.connect(host_port)
+                    break
+                except OSError:
+                    sock.close()
+                    continue
+            else:
+                # create no connection
+                return False
             # ヘッダーを送る
             send = json.dumps(self.get_server_header()).encode()
             with self.lock:
@@ -150,7 +179,7 @@ class Core(Thread):
             self.traffic.put_traffic_up(encrypted)
 
             Thread(target=self.__receive_msg,
-                   name='C:' + new_user.name, daemon=True, args=(new_user,)).start()
+                   name='C:' + new_user.name, args=(new_user,), daemon=True).start()
 
             c = 20
             while len(self.user) == 0 and c > 0:
@@ -160,27 +189,26 @@ class Core(Thread):
                 return False
             else:
                 return True
+        except json.JSONDecodeError:
+            logging.debug("Json decode error.")
         except PeerToPeerError as e:
-            try: sock.close()
-            except: pass
             logging.debug("NewConnectionError {} {}".format(host_port, e), exc_info=Debug.P_EXCEPTION)
         except ConnectionRefusedError as e:
-            try: sock.close()
-            except: pass
             logging.debug("ConnectionRefusedError {} {}".format(host_port, e), exc_info=Debug.P_EXCEPTION)
         except Exception as e:
-            try: sock.close()
-            except: pass
             logging.error("NewConnectionError {} {}".format(host_port, e), exc_info=Debug.P_EXCEPTION)
+        # close socket
+        try: sock.close()
+        except: pass
         return False
 
-    def remove_connection(self, user):
+    def remove_connection(self, user, reason=None):
         with self.lock:
             if user in self.user:
                 self.user.remove(user)
                 try: user.close()
                 except: pass
-                logging.debug("remove connection to %s" % user.name)
+                logging.debug("remove connection to {} by \"{}\"".format(user.name, reason))
                 return True
             return False
 
@@ -191,8 +219,10 @@ class Core(Thread):
         if len(self.user) == 0:
             raise ConnectionError('client connection is zero.')
         elif len(msg_body) > C.MAX_RECEIVE_SIZE + 5000:
-            raise ConnectionRefusedError('Max message size is {}Kb (You try {}Kb)'
-                                         .format(C.MAX_RECEIVE_SIZE / 1000, len(msg_body) / 1000))
+            error = 'Max message size is {}kb (You try {}Kb)'.format(
+                round(C.MAX_RECEIVE_SIZE/1000000, 3), round(len(msg_body)/1000000, 3))
+            self.send_msg_body(msg_body=bjson.dumps(error), user=user)
+            raise ConnectionRefusedError(error)
         elif user is None:
             user = random.choice(self.user)
 
@@ -254,8 +284,8 @@ class Core(Thread):
         except Exception as e:
             logging.debug(e, exc_info=Debug.P_EXCEPTION)
         else:
-            Thread(target=self.__receive_msg, name='S:' + new_user.name,
-                   daemon=True, args=(new_user,)).start()
+            Thread(target=self.__receive_msg,
+                   name='S:'+new_user.name, args=(new_user,), daemon=True).start()
             return
         # close socket
         try: sock.close()
